@@ -68,6 +68,14 @@ graph TD
 
 **踩坑**：max_tokens 设 4096 时 Stage 输出被截断，后续 Stage 拿到不完整输入导致逻辑断裂。改为 8192 并在每级输出后做完整性校验（检查 JSON/Markdown 结构是否闭合）。
 
+**分析链上的三处增强**：
+
+- **多模态一致性冲突检测**：`full` 模式下 Stage1 之前，先把转写稿与关键帧视觉描述一起送模型找矛盾点（`CONFLICT_SYSTEM` / `_detect_conflict`），把"说的和画的对不对得上"作为真实性判据，而不是只信语音一路。
+- **长视频分段提炼（map-reduce 的 map）**：超阈值（12000 字/段）的转写稿先逐段 LLM 压缩、保信息再去冗余，然后才进分析链；短视频零改动。避免硬截断丢内容，也控住 token 成本。
+- **Stage1 结构化输出**：真实性判断走 Pydantic schema 约束 + 别名归一，产出真/假/存疑的可解析契约而非自由文本，方便下游按字段消费。
+
+**取消信号穿透兜底链**：仪表盘的"停止"用继承 `BaseException` 的自定义异常（`_AnalysisCancelled`）抛出，专门绕过兜底链里宽 `except Exception`——否则取消会被当成"这个模型失败了"继续去烧下一个兜底 provider 的 token。
+
 ### 3. Token 用量追踪
 
 **问题**：多模型多阶段调用，成本不透明。
@@ -181,7 +189,7 @@ agent 节点（模型思考）
 
 **自建极简自测页**：内联 HTML 零 CDN，避开 FastAPI 默认 `/docs` 从 jsdelivr 加载在国内白屏的问题。
 
-**安全护栏**：非回环绑定 + 无鉴权 = 任何能连进来的设备都能刷 `/kb/ask` 烧 token。启动时对非本机绑定打醒目告警，并设 `MAX_BUILD_ITEMS` 等上限约束单次入库规模。
+**安全护栏**：默认只绑 `127.0.0.1`；对外/容器暴露时必须设 `API_TOKEN`，否则任何人都能刷 `/kb/ask` 烧 LLM 额度。护栏分层：端点统一走 `X-API-Token` 鉴权（不匹配 401，`API_TOKEN` 为空则退化为"仅本机安全"并在非回环绑定打醒目告警）、滑动窗口限流（`RATE_LIMIT`，超限 429）、请求体上限（`MAX_BUILD_ITEMS`/`MAX_ITEM_CHARS`，超限 400）。
 
 **Docker 边界**：容器只打包 RAG FastAPI 服务（`src/api.py`），不含 whisper/yt-dlp 主流程；日常开发测试走 conda/.venv，只有专门验证容器部署时才 `compose up`。
 
@@ -205,7 +213,7 @@ agent 节点（模型思考）
 
 ## 已知限制
 
-- 抖音 cookies 有效期短（约 7 天），过期后下载失败需要重新导出
+- 抖音 cookies 约每月需刷新一次；已提供一键刷新工具（`tools/refresh_douyin_cookies.py`，Playwright + Edge 扫码自动导出 Netscape cookies 并真实解析验证，旧文件自动备份）。更本质的限制是：抖音 detail 接口风控严格，同一套有效 cookies 也会间歇返回 403，下载/验证侧已做有限次重试。
 - B站免 cookies 但有频率限制，批量下载会触发风控
 - 视觉模式依赖 qwen-vl 多模态模型，免费额度有限
-- 用户画像文件是静态 YAML，不支持运行时动态更新
+- 用户画像通过仪表盘「我的画像」编辑器在线编辑 `user_profile.yaml`（保存前用 `yaml.safe_load` 校验语法、写前自动备份 `.bak`）；改完**下次分析即生效**——单次运行内不热重载，也不回改已生成的报告，不是进程内实时更新。
