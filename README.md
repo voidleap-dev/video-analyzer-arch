@@ -100,6 +100,97 @@ graph TD
 
 ---
 
+## 检索增强与 Agent 化（RAG / Agent / 评估 / 服务化 / MCP）
+
+> 前面的三级分析链解决"单个视频这一次怎么看"；这一节解决"看过的所有内容如何变成可问答、可被 Agent 调用的知识资产"。项目已积累大量转写稿与分析报告，光靠一次性消费会浪费——于是补齐了 RAG 知识库、LangGraph Agent、RAGAS 口径评估、FastAPI+SSE 服务化，并把能力再封装成 MCP 工具。
+
+```mermaid
+graph LR
+    A[分析报告 output/*.md] -->|/kb/reindex 自动入库| B[RAG 知识库<br>Chroma + bge]
+    B --> C[混合检索<br>向量 + BM25 + RRF]
+    C --> D[问答 /kb/ask]
+    C --> E[LangGraph Agent<br>自主调用工具]
+    D --> F[FastAPI + SSE<br>流式服务]
+    E --> F
+    C --> G[MCP Server<br>对外挂载]
+```
+
+### 6. RAG 知识库：把产出变成可问答的资产
+
+**问题**：转写稿和报告越攒越多，但只会"生成一次就放着"，没法基于历史内容追问。
+
+**方案**：把已产出的文本向量化入库，做检索增强问答闭环。
+
+- **向量模型**：BAAI `bge-small-zh-v1.5`（~100MB，CPU 可跑，中文友好，零 API 成本）；精度升级路径是 `bge-large-zh` / `bge-m3`。
+- **bge 的非对称用法**（最容易做错的一点）：官方建议**查询侧**加检索指令前缀"为这个句子生成表示以用于检索相关文章："，**文档侧不加**。两边都不加或都加都会拉低召回。
+- **向量归一化 + Chroma cosine 空间**：向量已归一化，cosine 距离等价于按点积相似度排序。
+- **分块**：按段落贪心打包（~500 字/块），超长段按中文句末标点（。！？；）再切，相邻块保留 80 字重叠，保持上下文完整，不硬切句子。
+- **混合检索**：向量召回（管"语义像不像"）+ BM25 关键词召回（管"关键词命没命中"，中文按单字+二元组分词），用 **RRF（Reciprocal Rank Fusion）** 融合排名：`score(d) = Σ 1/(k + rank)`，k 取 60（论文经验值）抑制头部排名独大。两路互补——向量抓语义近似，BM25 兜住专有名词/数字这类精确命中。
+- **问答**：检索到的片段拼进 prompt，约束模型"只依据资料答、资料没有就说未提及、末尾用 [编号] 标注引用"，并回传引用来源。
+- **可测性设计**：LLM 以 `callable(system, user) -> str` 注入，RAG 模块不强绑具体模型和网络，因此可以完全离线跑测试。
+
+**踩坑**：首次运行要下载 bge 模型，直连 HuggingFace 会卡死。模块内 `os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")` 兜底走国内镜像，不依赖外部是否配置。
+
+### 7. Agent 化：从固定流水线到 LangGraph ReAct
+
+**问题**：`下载 → 转写 → 分析` 写死成固定顺序，用户想"把上周那几个讲 X 的视频里关于 Y 的部分捞出来对比"这类动态需求时，硬编码流程接不住。
+
+**方案**：把能力封装成 tools，交给大模型根据用户指令**自主决定调用哪个、按什么顺序、何时结束**。
+
+用 LangGraph 的 `StateGraph` 把 ReAct 循环表达成一张图：
+
+```
+agent 节点（模型思考）
+  → tools_condition 判断：
+      模型请求工具 → tools 节点执行 → 结果回喂 agent → 再思考
+      模型直接作答 → END
+```
+
+- **工具复用已有能力**：`search_kb`（查第 6 节的 RAG 知识库）、`count_text`（精确字符/中文字/英文词/token 统计）、`format_timestamp`（秒 → MM:SS）。
+- **@tool 的 docstring 是给模型看的"工具说明书"**——写清"什么时候该调用我"直接决定模型会不会正确调用，这部分比函数体更值得打磨。
+- **防失控**：`recursion_limit`（默认 12）限制最大轮数防死循环；工具自带失败容错。
+
+**取舍**：工具返回统一用字符串而非结构化对象——模型读文本即可，省掉 schema 维护成本。
+
+### 8. RAG 评估：RAGAS 同口径的轻量自实现
+
+**问题**：RAG 搭完不知道好不好，调参全靠感觉。
+
+**方案**：按 RAGAS 指标口径做**分层评估**。
+
+| 层级 | 指标 | 怎么算 | 是否花模型钱 |
+|------|------|--------|-------------|
+| 检索层 | recall@k / precision@k | top-k 覆盖了多少"该被召回的来源"，纯确定性计算 | 否 |
+| 生成层 | faithfulness（忠实度） | 答案里有多少论断能被检索上下文支撑（治幻觉），LLM-as-judge 0~1 | 是 |
+| 生成层 | answer relevancy（相关性） | 答案是否切题，LLM-as-judge 0~1 | 是 |
+
+裁判模型输出解析做鲁棒兜底：先抠 JSON 里的 `score`，抠不到再退化成正则抓 0~1 数字，避免裁判偶尔不守格式就整批失败。
+
+**为什么不用 ragas 库**：ragas 会拉入它自己的 langchain 版本约束，和本项目 `langchain-core 1.6` 栈冲突、动摇已经跑通的 RAG/Agent；而且自实现逼自己真正理解每个指标的定义。这点的工程价值在于"我能解释 RAGAS 的 faithfulness 和 relevancy 分别治什么问题，以及为什么不用现成库"，比"pip 装一下跑一遍"扛得住深挖。
+
+### 9. 服务化与可观测：FastAPI + SSE
+
+**问题**：只跑本地脚本，长文本问答没法渐进反馈，也无法对外提供能力。
+
+**方案**：FastAPI 暴露一组端点：
+
+- `POST /kb/build`：用给定语料重建知识库；
+- `POST /kb/reindex`：扫描 `output/*.md` 自动入库，把"分析 → 自动入库 → 可问答"闭成环；
+- `POST /kb/ask`：一次性问答；
+- `POST /kb/ask/stream`：**SSE 流式**问答（打字机效果，先推 `event: sources` 引用，再逐 token 推 answer 增量）。
+
+**自建极简自测页**：内联 HTML 零 CDN，避开 FastAPI 默认 `/docs` 从 jsdelivr 加载在国内白屏的问题。
+
+**安全护栏**：非回环绑定 + 无鉴权 = 任何能连进来的设备都能刷 `/kb/ask` 烧 token。启动时对非本机绑定打醒目告警，并设 `MAX_BUILD_ITEMS` 等上限约束单次入库规模。
+
+**Docker 边界**：容器只打包 RAG FastAPI 服务（`src/api.py`），不含 whisper/yt-dlp 主流程；日常开发测试走 conda/.venv，只有专门验证容器部署时才 `compose up`。
+
+### 10. MCP 工具化：一份能力，多个出口
+
+把 `search_kb` / `count_text` / `format_timestamp` 用 MCP Python SDK v2（`MCPServer`，原 FastMCP 改名）封装成 Model Context Protocol 工具，`mcp.run(transport="stdio")`。任何支持 MCP 的客户端（Claude Desktop、各类 Agent）都能直接挂载调用。同一批能力，LangGraph 内部编排用一套、对外以 MCP 暴露又是一套出口——工具说明复用 docstring，不重复实现。
+
+---
+
 ## 工程约束与取舍
 
 | 决策 | 选择 | 放弃的方案 | 原因 |
